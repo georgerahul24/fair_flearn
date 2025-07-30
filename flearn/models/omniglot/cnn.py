@@ -1,10 +1,44 @@
 import numpy as np
 import os, sys
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import trange
 
 from flearn.utils.model_utils import batch_data
-from flearn.utils.tf_utils import graph_size, process_grad
+
+
+class CNN(nn.Module):
+    def __init__(self, num_classes):
+        super(CNN, self).__init__()
+        # Conv layers
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, padding=2)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Dense layers
+        self.fc1 = nn.Linear(7 * 7 * 64, 2048)
+        self.fc2 = nn.Linear(2048, num_classes)
+        self.dropout = nn.Dropout(0.5)
+        
+    def forward(self, x):
+        # Reshape input from [batch, 784] to [batch, 1, 28, 28]
+        x = x.view(-1, 1, 28, 28)
+        
+        # Conv layers
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        
+        # Flatten for dense layers
+        x = x.view(-1, 7 * 7 * 64)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
 
 
 class Model(object):
@@ -13,126 +47,205 @@ class Model(object):
     '''
 
     def __init__(self, num_classes, q, optimizer, seed=1):
-
+        
+        # Set random seed for reproducibility
+        torch.manual_seed(123 + seed)
+        np.random.seed(123 + seed)
+        
         # params
         self.num_classes = num_classes
-
-        # create computation graph
-        self.graph = tf.Graph()
-        with self.graph.as_default():
-            tf.set_random_seed(123 + seed)
-            self.features, self.labels, self.train_op, self.grads, self.eval_metric_ops, self.loss = self.create_model(
-                q, optimizer)
-            self.saver = tf.train.Saver()
-        self.sess = tf.Session(graph=self.graph)
-
-        # find memory footprint and compute cost of the model
-        self.size = graph_size(self.graph)
-        with self.graph.as_default():
-            self.sess.run(tf.global_variables_initializer())
-            metadata = tf.RunMetadata()
-            opts = tf.profiler.ProfileOptionBuilder.float_operation()
-            self.flops = tf.profiler.profile(self.graph, run_meta=metadata, cmd='scope', options=opts).total_float_ops
-
-    def create_model(self, q, optimizer):
-        """Model function for CNN."""
-        features = tf.placeholder(tf.float32, shape=[None, 28 * 28], name='features')
-        labels = tf.placeholder(tf.int64, shape=[None], name='labels')
-        input_layer = tf.reshape(features, [-1, 28, 28, 1])
-        conv1 = tf.layers.conv2d(
-            inputs=input_layer,
-            filters=32,
-            kernel_size=[5, 5],
-            padding="same",
-            activation=tf.nn.relu)
-        pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
-        conv2 = tf.layers.conv2d(
-            inputs=pool1,
-            filters=64,
-            kernel_size=[5, 5],
-            padding="same",
-            activation=tf.nn.relu)
-        pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
-        pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
-        dense = tf.layers.dense(inputs=pool2_flat, units=2048, activation=tf.nn.relu)
-        logits = tf.layers.dense(inputs=dense, units=self.num_classes)
-        predictions = {
-            "classes": tf.argmax(input=logits, axis=1),
-            "probabilities": tf.nn.softmax(logits, name="softmax_tensor")
-        }
-        loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
-        grads_and_vars = optimizer.compute_gradients(loss)
-        grads, _ = zip(*grads_and_vars)
-        train_op = optimizer.apply_gradients(grads_and_vars, global_step=tf.train.get_global_step())
-
-        eval_metric_ops = tf.count_nonzero(tf.equal(labels, predictions["classes"]))
-        return features, labels, train_op, grads, eval_metric_ops, loss
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # create model
+        self.model = CNN(num_classes).to(self.device)
+        
+        # Store optimizer class and params (will be instantiated in create_optimizer)
+        self.optimizer_class = optimizer
+        self.optimizer = None
+        
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss()
+        
+        # Calculate model size and FLOPs
+        self.size = self._calculate_model_size()
+        self.flops = self._calculate_flops()
+    
+    def create_optimizer(self, lr=0.01, weight_decay=0.0):
+        """Create optimizer"""
+        if self.optimizer_class == 'sgd':
+            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        elif self.optimizer_class == 'adam':
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            # Default to SGD if optimizer not recognized
+            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    def _calculate_model_size(self):
+        """Calculate model size in bytes"""
+        total_size = 0
+        for param in self.model.parameters():
+            total_size += param.numel() * param.element_size()
+        return total_size
+    
+    def _calculate_flops(self):
+        """Approximate FLOPs calculation for CNN"""
+        # This is a simplified calculation - in practice you'd want more precise FLOP counting
+        # Conv1: 28*28*32*5*5*1 + Conv2: 14*14*64*5*5*32 + FC1: 7*7*64*2048 + FC2: 2048*num_classes
+        conv1_flops = 28 * 28 * 32 * 5 * 5 * 1
+        conv2_flops = 14 * 14 * 64 * 5 * 5 * 32
+        fc1_flops = 7 * 7 * 64 * 2048
+        fc2_flops = 2048 * self.num_classes
+        return conv1_flops + conv2_flops + fc1_flops + fc2_flops
 
     def set_params(self, model_params=None):
+        """Set model parameters"""
         if model_params is not None:
-            with self.graph.as_default():
-                all_vars = tf.trainable_variables()
-                for variable, value in zip(all_vars, model_params):
-                    variable.load(value, self.sess)
+            param_dict = {}
+            param_names = []
+            for name, param in self.model.named_parameters():
+                param_names.append(name)
+            
+            # Assuming model_params is a list of numpy arrays in the same order
+            for i, (name, param) in enumerate(self.model.named_parameters()):
+                if i < len(model_params):
+                    param.data = torch.from_numpy(model_params[i]).to(self.device)
 
     def get_params(self):
-        with self.graph.as_default():
-            model_params = self.sess.run(tf.trainable_variables())
+        """Get model parameters as list of numpy arrays"""
+        model_params = []
+        for param in self.model.parameters():
+            model_params.append(param.data.cpu().numpy())
         return model_params
 
     def get_gradients(self, data, latest_model):
-
-        '''
-        with self.graph.as_default():
-            model_grads = self.sess.run(self.grads,
-                feed_dict={self.features: data['x'], self.labels: data['y']})
-        return model_grads
-        '''
-        model_len = process_grad(latest_model).size
-        grads = np.zeros(model_len)
+        """Get gradients for given data"""
+        self.model.eval()
+        
+        # Calculate model length from latest_model (list of parameter arrays)
+        model_len = sum(param.size for param in latest_model)
+        
+        # Convert data to tensors
+        features = torch.from_numpy(data['x']).float().to(self.device)
+        labels = torch.from_numpy(data['y']).long().to(self.device)
+        
+        # Zero gradients
+        self.model.zero_grad()
+        
+        # Forward pass
+        outputs = self.model(features)
+        loss = self.criterion(outputs, labels)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Extract gradients and flatten
+        grads = []
+        for param in self.model.parameters():
+            if param.grad is not None:
+                grads.append(param.grad.data.cpu().numpy().flatten())
+        
+        # Concatenate all gradients
+        flat_grads = np.concatenate(grads) if grads else np.zeros(model_len)
+        
         num_samples = len(data['y'])
-
-        with self.graph.as_default():
-            model_grads = self.sess.run(self.grads,
-                                        feed_dict={self.features: data['x'], self.labels: data['y']})
-            grads = process_grad(model_grads)
-
-        return num_samples, grads
+        return num_samples, flat_grads
 
     def get_loss(self, data):
-        with self.graph.as_default():
-            loss = self.sess.run(self.loss, feed_dict={self.features: data['x'], self.labels: data['y']})
-        return loss
+        """Get loss for given data"""
+        self.model.eval()
+        
+        # Convert data to tensors
+        features = torch.from_numpy(data['x']).float().to(self.device)
+        labels = torch.from_numpy(data['y']).long().to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model(features)
+            loss = self.criterion(outputs, labels)
+        
+        return loss.item()
 
     def solve_sgd(self, mini_batch_data):
-        with self.graph.as_default():
-            grads, loss, _ = self.sess.run([self.grads, self.loss, self.train_op],
-                                           feed_dict={self.features: mini_batch_data[0],
-                                                      self.labels: mini_batch_data[1]})
-
+        """Single SGD step"""
+        if self.optimizer is None:
+            self.create_optimizer()
+            
+        self.model.train()
+        
+        # Convert data to tensors
+        features = torch.from_numpy(mini_batch_data[0]).float().to(self.device)
+        labels = torch.from_numpy(mini_batch_data[1]).long().to(self.device)
+        
+        # Zero gradients
+        self.optimizer.zero_grad()
+        
+        # Forward pass
+        outputs = self.model(features)
+        loss = self.criterion(outputs, labels)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Extract gradients before optimizer step
+        grads = []
+        for param in self.model.parameters():
+            if param.grad is not None:
+                grads.append(param.grad.data.cpu().numpy())
+        
+        # Optimizer step
+        self.optimizer.step()
+        
         weights = self.get_params()
-        return grads, loss, weights
+        return grads, loss.item(), weights
 
     def solve_inner(self, data, num_epochs=1, batch_size=32):
-        '''Solves local optimization problem'''
+        """Solves local optimization problem"""
+        if self.optimizer is None:
+            self.create_optimizer()
+            
+        self.model.train()
+        
         for _ in trange(num_epochs, desc='Epoch: ', leave=False, ncols=120):
             for X, y in batch_data(data, batch_size):
-                with self.graph.as_default():
-                    self.sess.run(self.train_op,
-                                  feed_dict={self.features: X, self.labels: y})
+                # Convert to tensors
+                features = torch.from_numpy(X).float().to(self.device)
+                labels = torch.from_numpy(y).long().to(self.device)
+                
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.model(features)
+                loss = self.criterion(outputs, labels)
+                
+                # Backward pass and optimize
+                loss.backward()
+                self.optimizer.step()
+        
         soln = self.get_params()
         comp = num_epochs * (len(data['y']) // batch_size) * batch_size * self.flops
         return soln, comp
 
     def test(self, data):
-        '''
+        """Test the model
         Args:
             data: dict of the form {'x': [list], 'y': [list]}
-        '''
-        with self.graph.as_default():
-            tot_correct, loss = self.sess.run([self.eval_metric_ops, self.loss],
-                                              feed_dict={self.features: data['x'], self.labels: data['y']})
-        return tot_correct, loss
+        """
+        self.model.eval()
+        
+        # Convert data to tensors
+        features = torch.from_numpy(data['x']).float().to(self.device)
+        labels = torch.from_numpy(data['y']).long().to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model(features)
+            loss = self.criterion(outputs, labels)
+            
+            # Get predictions
+            _, predicted = torch.max(outputs.data, 1)
+            tot_correct = (predicted == labels).sum().item()
+        
+        return tot_correct, loss.item()
 
     def close(self):
-        self.sess.close()
+        """Close/cleanup - not needed in PyTorch but kept for compatibility"""
+        pass
